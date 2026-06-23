@@ -1,173 +1,255 @@
 # Orbit Wars
 
-Conquer planets rotating around a sun in continuous 2D space. A real-time strategy game for 2 or 4 players.
+A competition agent for **Orbit Wars** — a real-time strategy game where 2 or 4
+players conquer planets orbiting a sun in continuous 2D space. Whoever holds the
+most ships (on planets + in fleets) after 500 turns wins.
 
-## Overview
+This repo holds the agent (`orbit_v2/`), the analysis tooling used to develop it,
+and the design records for the experiments. The [game rules](#game-rules-reference)
+are documented at the bottom.
 
-Players start with a single home planet and compete to control the map by sending fleets to capture neutral and enemy planets. The board is a 100x100 continuous space with a sun at the center. Planets orbit the sun, comets fly through on elliptical trajectories, and fleets travel in straight lines. The game lasts 500 turns. The player with the most total ships (on planets + in fleets) at the end wins.
+---
 
-## Board Layout
+## Result
+
+| | |
+|---|---|
+| **Best stable score** | ~**1239** Elo (peak **1352**) — the `orbit_v2` agent, 2026-06-12 |
+| **Final submitted pair** | `holdwindow8` + `B_holdwindow` (the two most *consistent* configs) |
+| **Goal** | Top 10% of the field |
+
+The leaderboard uses a continuously-updated Elo: agents keep playing and the rating
+drifts. Fresh submissions start at ~600 and take ~a day of games to converge to their
+true level. The final pair was chosen for **consistency** (validated across both the
+leaderboard and the local arena), not single-run peak.
+
+---
+
+## The agent (`orbit_v2/`)
+
+The agent is a **flow-based greedy planner**, not a search or ML policy. Each turn it
+projects the board forward and scores candidate fleet launches by their effect on a
+competitive objective, then greedily commits the best non-conflicting waves.
+
+**Pipeline (`orbit_v2/main.py` → `orbit_v2/orbit_lite/`):**
+
+1. **Forward projection** (`orbit_lite/movement.py`, `garrison_launch.py`) — a
+   bit-exact simulation of planet rotation, fleet flight, production, and combat over a
+   short horizon (18 turns in 2P, 13 in 4P).
+2. **Candidate generation** (`plan_lite_waves` in `main.py`) — for each (source, target)
+   pair it computes a **capture floor** (`capture_floor`: min ships to take the planet,
+   accounting for the defender's projected garrison) and a **safe drain** (`safe_drain`:
+   max ships a source can shed while still holding itself).
+3. **Scoring** (`score_candidates` → `sparse_launch_flow_delta` → `competitive_score`) —
+   each launch is scored by the *delta* it causes in `Δnet_ships_me − Σ Δnet_ships_opp`,
+   computed exactly via a sparse per-planet flow projector.
+4. **Greedy selection** (`_greedy_select`) — picks the best wave each iteration (one per
+   target, source-budget-aware) while its competitive score clears an ROI gate; leftover
+   ships are reinforced/regrouped.
+
+**The one winning lever:** a **reactive-reinforcement margin** (`reinforce_margin_frac=0.6`)
+fed into `capture_floor`. Stock scoring sizes attacks against a *do-nothing* projection;
+the margin makes the agent send enough to survive the defender's reactive counter — fixing
+the scorer's main blind spot. This took the agent from the ~870-890 tier (`proto_agent`
+v1.x) to ~1240.
+
+Behavior is tuned by `ProducerLiteConfig`; `CONFIG_2P` / `CONFIG_4P` hold the shipped
+values, overridable at runtime via the `ORBIT_V2_2P` / `ORBIT_V2_4P` env vars (JSON).
+
+---
+
+## What worked, and what didn't
+
+The hard-won lesson of this project: **candidate-level tweaks that the flow scorer can
+already price are outcome-neutral, and "expand more" levers are actively harmful.** Real
+edges must fix what the scorer *cannot see* (opponent reactions).
+
+**Worked**
+- Reactive-reinforcement margin (`reinforce_margin_frac=0.6`) — the core win.
+- Hold-window margin (`margin_hold_turns`) — only count enemy mass that reaches a target
+  *after* our arrival, so we capture what survives the immediate counter (`B`/`holdwindow8`).
+
+**Refuted (documented so they aren't retried)**
+- **Expansion-volume levers** — `expand_value_frac` (thin-garrison trap), early quality
+  multipliers, blanket fleet-fraction cuts, the **surplus-expansion valve** (shipped, LB
+  1073 vs 1176), and the **terminal-value tempo knob** (implemented default-off, no robust
+  local edge). Conclusion: expanding *more* just takes planets we can't hold under enemy
+  reaction. The unbuilt direction is expansion *quality* / reaction-aware holdability.
+- **Defensive reworks** — precise-defense / post-capture holdability (LB 1062).
+- Candidate-level no-ops the scorer already prices: cheap-target shortlist slots,
+  multi-size sends, cap-drain margin, 4P capacity scaling.
+
+Full write-ups in `analysis/FINDINGS_2026-06-21_latest2.md` and
+`docs/superpowers/specs/`.
+
+---
+
+## Repo layout
+
+```
+orbit_v2/                  Active agent
+  main.py                  Planner + ProducerLiteConfig (CONFIG_2P / CONFIG_4P)
+  orbit_lite/              Engine: movement, garrison/flow projection, scoring, aiming
+  build_stock_submissions.py   Builds a submission tarball for a given config
+  orbit_v2_submission*.tar.gz   The 3 tarballs active on the leaderboard
+  PLAN.md                  Blind-spot / future-edge list
+analysis/                  Development & analysis tooling (see below)
+docs/superpowers/          Design specs & implementation plans for experiments
+agent_log/                 Downloaded leaderboard replays (ours + top opponents)
+opponents/                 Local sparring agents (buddy_v5, etc.)
+archive/                   Older proto_agent work + the forward simulator
+proto_agent.py             v1.x agent (pre-pivot, ~870-890 tier)
+.env                       Kaggle API token (gitignored)
+```
+
+## Running it
+
+Everything runs with the project venv (`venv/bin/python`) — the agent imports `torch`
+but **not** the kaggle CLI, so it's unaffected by the slow-import caveat below.
+
+```bash
+# Run the agent vs a local opponent on a seed (kaggle_environments must be installed)
+venv/bin/python -c "from kaggle_environments import make; ..."   # see analysis/ scripts
+
+# Build a submission tarball for a config
+venv/bin/python orbit_v2/build_stock_submissions.py
+
+# Submit / check standings (needs the throwaway kaggle CLI — see Caveats)
+set -a; source .env; set +a
+/tmp/kgl/bin/kaggle competitions submit orbit-wars -f orbit_v2/<tarball> -m "..."
+/tmp/kgl/bin/kaggle competitions submissions orbit-wars
+```
+
+## Tooling (`analysis/`)
+
+| Script | Purpose |
+|---|---|
+| `pull_replays.py` | Download recent episode replays for a submission (stdlib-only) |
+| `phdef_autopsy.py` | Per-replay autopsy: planet/ship trajectories, win/loss diagnosis |
+| `arena_oracle.py` | Local regression gate vs a fixed opponent pool |
+| `verify_terminal_value.py` | Subprocess-isolated config A/B + λ sweep harness |
+| `test_terminal_value.py` | Unit tests for the terminal-value scoring term |
+
+**Win/loss discriminator** (from replay analysis): track when our total-ship stockpile
+peaks. Wins peak at the *end* of the game (snowball); losses peak *mid-game* (we hoard
+idle ships and get out-expanded). `argmax(ships)/T` near 1.0 = healthy.
+
+## Caveats (read before extending)
+
+- **Local oracle ceiling** — local opponents cap at the ~1000-1100 tier; only `buddy_v5`
+  and 4P self-play discriminate. Local win-rate is a regression gate, **not** proof of a
+  leaderboard gain. Real validation is an A/B submission.
+- **Win-rate varies hugely by seed batch** — never conclude from one batch; a single good
+  batch repeatedly turned out to be noise.
+- **Harness nondeterminism** — `kaggle_environments` + agent is deterministic *across*
+  processes but **not within one** (global state leaks between sequential `env.run` calls).
+  Run each (seed, config) cell in its own subprocess (`verify_terminal_value.py` does this).
+- **Kaggle CLI** — the Google-Drive filesystem times out importing the kaggle package's
+  protobuf, so the CLI lives in a throwaway venv at `/tmp/kgl`. Recreate with
+  `python3 -m venv /tmp/kgl && /tmp/kgl/bin/pip install kaggle` (token is in `.env`).
+  The agent itself does not need this.
+
+---
+
+## Game Rules Reference
+
+Conquer planets rotating around a sun in continuous 2D space. A real-time strategy game
+for 2 or 4 players.
+
+### Overview
+
+Players start with a single home planet and compete to control the map by sending fleets
+to capture neutral and enemy planets. The board is a 100x100 continuous space with a sun
+at the center. Planets orbit the sun, comets fly through on elliptical trajectories, and
+fleets travel in straight lines. The game lasts 500 turns. The player with the most total
+ships (on planets + in fleets) at the end wins.
+
+### Board Layout
 
 - **Board**: 100x100 continuous space, origin at top-left.
 - **Sun**: Centered at (50, 50) with radius 10. Fleets that cross the sun are destroyed.
-- **Symmetry**: All planets and comets are placed with 4-fold mirror symmetry around the center: (x, y), (100-x, y), (x, 100-y), (100-x, 100-y). This ensures fairness regardless of starting position.
+- **Symmetry**: All planets and comets are placed with 4-fold mirror symmetry around the
+  center: (x, y), (100-x, y), (x, 100-y), (100-x, 100-y).
 
-## Planets
+### Planets
 
-Each planet is represented as `[id, owner, x, y, radius, ships, production]`.
+Each planet is `[id, owner, x, y, radius, ships, production]`.
 
 - **owner**: Player ID (0-3), or -1 for neutral.
-- **radius**: Determined by production: `1 + ln(production)`. Higher production planets are physically larger.
-- **production**: Integer from 1 to 5. Each turn, an owned planet generates this many ships.
-- **ships**: Current garrison. Starts between 5 and 99 (skewed toward lower values).
+- **radius**: `1 + ln(production)`.
+- **production**: Integer 1-5; each turn an owned planet generates this many ships.
+- **ships**: Current garrison. Starts between 5 and 99 (skewed low).
+- **Orbiting** planets (`orbital_radius + planet_radius < 50`) rotate at 0.025-0.05
+  rad/turn; **static** planets do not. Use `initial_planets` + `angular_velocity` to
+  predict positions. Map has 20-40 planets (5-10 symmetric groups of 4).
+- **Home planets**: one symmetric group; 2P start diagonally opposite (Q1/Q4), 4P one
+  each. Home planets start with 10 ships.
 
-### Planet Types
+### Fleets
 
-- **Orbiting planets**: Planets whose `orbital_radius + planet_radius < 50` rotate around the sun at a constant angular velocity (0.025-0.05 radians/turn, randomized per game). Use `initial_planets` and `angular_velocity` from the observation to predict their positions.
-- **Static planets**: Planets further from the center do not rotate.
+Each fleet is `[id, owner, x, y, angle, from_planet_id, ships]`.
 
-The map contains 20-40 planets (5-10 symmetric groups of 4). At least 3 groups are guaranteed to be static, and at least one group is guaranteed to be orbiting.
+- **Speed** scales with size: `speed = 1.0 + (maxSpeed-1.0) * (log(ships)/log(1000))^1.5`
+  (1 ship → 1.0, ~1000 ships → max 6.0).
+- Fleets travel straight and are removed on out-of-bounds, sun crossing, or planet
+  collision (continuous path-segment detection; collision triggers combat).
+- **Launch**: each turn return `[from_planet_id, direction_angle, num_ships]` moves from
+  planets you own; can't send more than the planet holds; multiple launches allowed.
 
-### Home Planets
+### Comets
 
-One symmetric group is randomly chosen as the starting planets. In a 2-player game, players start on diagonally opposite planets (Q1 and Q4). In a 4-player game, each player gets one planet from the group. Home planets start with 10 ships.
+Temporary objects on elliptical orbits, spawning in groups of 4 (one per quadrant) at
+steps 50/150/250/350/450. Radius 1.0, production 1/turn, low starting ships. They obey
+all planet rules. Identified via `comet_planet_ids`; trajectories in `comets`. Removed
+(with their garrison) when they leave the board, before fleet launches.
 
-## Fleets
+### Turn Order
 
-Each fleet is represented as `[id, owner, x, y, angle, from_planet_id, ships]`.
+1. Comet expiration → 2. Comet spawning → 3. Fleet launch → 4. Production →
+5. Fleet movement (out-of-bounds / sun / planet collision) → 6. Planet rotation & comet
+movement (sweeps caught fleets into combat) → 7. Combat resolution.
 
-- **angle**: Direction of travel in radians.
-- **ships**: Number of ships in the fleet (does not change during travel).
+### Combat
 
-### Fleet Speed
+When fleets collide with a planet:
 
-Fleet speed scales with size on a logarithmic curve:
+1. Arriving fleets grouped by owner; same-owner ships summed.
+2. Largest attacking force fights the second largest; the difference survives.
+3. A surviving attacker either reinforces (same owner) or fights the garrison (different
+   owner); if attackers exceed the garrison, the planet flips and the garrison becomes
+   the surplus.
+4. A tie destroys all attacking ships.
 
-```
-speed = 1.0 + (maxSpeed - 1.0) * (log(ships) / log(1000)) ^ 1.5
-```
+### Scoring and Termination
 
-- 1 ship moves at 1.0 units/turn.
-- Larger fleets move faster, approaching the maximum speed (default 6.0).
-- A fleet of ~500 ships moves at ~5, and ~1000 ships reaches the max.
+Game ends at 500 steps or when one/zero players remain. Final score = ships on owned
+planets + ships in owned fleets. Highest wins.
 
-### Fleet Movement
+### Observation Reference
 
-Fleets travel in a straight line at their computed speed each turn. A fleet is removed if it:
+| Field | Description |
+|-------|-------------|
+| `planets` | `[[id, owner, x, y, radius, ships, production], ...]` (incl. comets) |
+| `fleets` | `[[id, owner, x, y, angle, from_planet_id, ships], ...]` |
+| `player` | Your player ID (0-3) |
+| `angular_velocity` | Planet rotation speed (rad/turn) |
+| `initial_planets` | Planet positions at game start |
+| `comets` | `[{planet_ids, paths, path_index}, ...]` |
+| `comet_planet_ids` | Planet IDs that are comets |
+| `remainingOverageTime` | Remaining overage time budget (seconds) |
 
-- Goes out of bounds (leaves the 100x100 playing field).
-- Crosses the sun (path segment comes within the sun's radius).
-- Collides with any planet (path segment comes within the planet's radius). This triggers combat.
+### Action Format
 
-Collision detection is continuous -- the entire path segment from old to new position is checked, not just the endpoint.
+Return `[[from_planet_id, direction_angle, num_ships], ...]` (angle in radians, 0 = right,
+π/2 = down), or `[]` for no action.
 
-### Fleet Launch
-
-Each turn, your agent returns a list of moves: `[from_planet_id, direction_angle, num_ships]`.
-
-- You can only launch from planets you own.
-- You cannot launch more ships than the planet currently has.
-- The fleet spawns just outside the planet's radius in the given direction.
-- You can issue multiple launches from the same or different planets in a single turn.
-
-## Comets
-
-Comets are temporary extra-solar objects that fly through the board on highly elliptical orbits around the sun. They spawn in groups of 4 (one per quadrant) at steps 50, 150, 250, 350, and 450.
-
-- **Radius**: 1.0 (fixed).
-- **Production**: 1 ship/turn when owned.
-- **Starting ships**: Random, skewed low (minimum of 4 rolls from 1-99). All 4 comets in a group share the same starting ship count.
-- **Speed**: Configurable via `cometSpeed` (default 4.0 units/turn).
-- **Identification**: Check `comet_planet_ids` in the observation to see which planet IDs are comets. Comets also appear in the `planets` array and follow all normal planet rules (capture, production, fleet launch, combat).
-
-When a comet leaves the board, it is removed along with any ships garrisoned on it. Comets are removed before fleet launches each turn, so you cannot launch from a departing comet.
-
-The `comets` observation field contains comet group data including `paths` (the full trajectory for each comet) and `path_index` (current position along the path), which can be used to predict future comet positions.
-
-## Turn Order
-
-Each turn executes in this order:
-
-1. **Comet expiration**: Remove comets that have left the board.
-2. **Comet spawning**: Spawn new comet groups at designated steps.
-3. **Fleet launch**: Process all player actions, creating new fleets.
-4. **Production**: All owned planets (including comets) generate ships.
-5. **Fleet movement**: Move all fleets along their headings. Check for out-of-bounds, sun collision, and planet collision. Fleets that hit planets are queued for combat.
-6. **Planet rotation & comet movement**: Orbiting planets rotate, comets advance along their paths. Any fleet caught by a moving planet/comet is swept into combat with it.
-7. **Combat resolution**: Resolve all queued planet combats.
-
-## Combat
-
-When one or more fleets collide with a planet (either by flying into it or being swept by a moving planet), combat is resolved:
-
-1. All arriving fleets are grouped by owner. Ships from the same owner are summed.
-2. The largest attacking force fights the second largest. The difference in ships survives.
-3. If there is a surviving attacker:
-   - If the attacker is the same owner as the planet, the surviving ships are added to the garrison.
-   - If the attacker is a different owner, the surviving ships fight the garrison. If the attackers exceed the garrison, the planet changes ownership and the garrison becomes the surplus.
-4. If two attackers tie, all attacking ships are destroyed (no survivors).
-
-## Scoring and Termination
-
-The game ends when:
-
-- **Step limit reached**: 500 turns.
-- **Elimination**: Only one player (or zero) remains with any planets or fleets.
-
-Final score = total ships on owned planets + total ships in owned fleets. Highest score wins.
-
-## Observation Reference
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `planets` | `[[id, owner, x, y, radius, ships, production], ...]` | All planets including comets |
-| `fleets` | `[[id, owner, x, y, angle, from_planet_id, ships], ...]` | All active fleets |
-| `player` | `int` | Your player ID (0-3) |
-| `angular_velocity` | `float` | Planet rotation speed (radians/turn) |
-| `initial_planets` | `[[id, owner, x, y, radius, ships, production], ...]` | Planet positions at game start |
-| `comets` | `[{planet_ids, paths, path_index}, ...]` | Active comet group data |
-| `comet_planet_ids` | `[int, ...]` | Planet IDs that are comets |
-| `remainingOverageTime` | `float` | Remaining overage time budget (seconds) |
-
-## Action Format
-
-Return a list of moves:
-
-```python
-[[from_planet_id, direction_angle, num_ships], ...]
-```
-
-- `from_planet_id`: ID of a planet you own.
-- `direction_angle`: Angle in radians (0 = right, pi/2 = down).
-- `num_ships`: Integer number of ships to send.
-
-Return an empty list `[]` to take no action.
-
-## Agent Convenience
-
-The module exports named tuples for easier field access:
-
-```python
-from kaggle_environments.envs.orbit_wars.orbit_wars import Planet, Fleet, CENTER, ROTATION_RADIUS_LIMIT
-
-def agent(obs):
-    planets = [Planet(*p) for p in obs.get("planets", [])]
-    fleets = [Fleet(*f) for f in obs.get("fleets", [])]
-    player = obs.get("player", 0)
-
-    for p in planets:
-        print(p.id, p.owner, p.x, p.y, p.radius, p.ships, p.production)
-
-    return []  # list of [from_planet_id, angle, num_ships]
-```
-
-## Configuration
+### Configuration
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `episodeSteps` | 500 | Maximum number of turns |
+| `episodeSteps` | 500 | Max turns |
 | `actTimeout` | 1 | Seconds per turn |
-| `shipSpeed` | 6.0 | Maximum fleet speed |
-| `sunRadius` | 10.0 | Radius of the sun |
+| `shipSpeed` | 6.0 | Max fleet speed |
+| `sunRadius` | 10.0 | Sun radius |
 | `boardSize` | 100.0 | Board dimensions |
 | `cometSpeed` | 4.0 | Comet speed (units/turn) |

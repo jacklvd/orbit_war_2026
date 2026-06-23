@@ -31,6 +31,9 @@ OPPONENT_PATHS = {
     "1103_opponent": ROOT / "opponents" / "1103_opponent.py",
     "marco":        ROOT / "opponents" / "marco_dg_v3_3_top_score_1060_5.py",
     "another1000":  ROOT / "opponents" / "another1000_lb.py",
+    "launch_safety_1039": ROOT / "opponents" / "launch_safety_1039.py",
+    "heuristic_sim_1000": ROOT / "opponents" / "heuristic_sim_1000.py",
+    "heuristic_sim_1050": ROOT / "opponents" / "heuristic_sim_1050.py",
 }
 
 
@@ -46,14 +49,13 @@ def _snap(obs, player):
     """Extract planet/ship/prod counts for both sides from one observation."""
     planets = obs.get("planets", [])
     fleets  = obs.get("fleets", [])
-    opponent = 1 - player
 
     my_p    = [p for p in planets if p[1] == player]
-    en_p    = [p for p in planets if p[1] == opponent]
+    en_p    = [p for p in planets if p[1] != player and p[1] != -1]
     neutral = [p for p in planets if p[1] == -1]
 
     my_transit = sum(f[6] for f in fleets if f[1] == player)
-    en_transit = sum(f[6] for f in fleets if f[1] == opponent)
+    en_transit = sum(f[6] for f in fleets if f[1] != player and f[1] != -1)
 
     return {
         "my_planets":  len(my_p),
@@ -68,8 +70,20 @@ def _snap(obs, player):
     }
 
 
-def run_game(proto_fn, opp_fn, proto_first, snap_turn):
-    if proto_first:
+def run_game(proto_fn, opp_fn, proto_first, snap_turn, num_players=2, opp_fn2=None, opp_fn3=None):
+    if num_players == 4:
+        proto_pid = proto_first % 4  # rotate through all 4 positions
+        if opp_fn3 is not None:
+            # 1x each: proto + opp1 + opp2 + opp3
+            slots = [opp_fn, opp_fn2, opp_fn3]
+        else:
+            # 2x opp1 + 1x opp2 (or 3x opp1 if no opp2)
+            opp2 = opp_fn2 if opp_fn2 is not None else opp_fn
+            slots = [opp_fn, opp_fn, opp2]
+        agents = slots[:]
+        agents.insert(proto_pid, proto_fn)  # insert proto at its position, shift rest
+        agents = agents[:4]  # trim to 4
+    elif proto_first:
         agents, proto_pid = [proto_fn, opp_fn], 0
     else:
         agents, proto_pid = [opp_fn, proto_fn], 1
@@ -82,23 +96,37 @@ def run_game(proto_fn, opp_fn, proto_first, snap_turn):
 
     for game_step, step_data in enumerate(env.steps):
         obs = step_data[proto_pid]["observation"]
-        s   = obs.get("step") or game_step   # fallback to loop index if obs.step is 0/None
+        s   = obs.get("step") or game_step
         if snapshot is None and s >= snap_turn:
             snapshot = _snap(obs, proto_pid)
         final_obs = obs
 
-    # Determine winner: most ships at game end
     if final_obs is None:
         return None, None
 
     planets = final_obs.get("planets", [])
-    opp_pid = 1 - proto_pid
-    my_ships    = sum(p[5] for p in planets if p[1] == proto_pid)
-    en_ships    = sum(p[5] for p in planets if p[1] == opp_pid)
-    my_planets  = sum(1 for p in planets if p[1] == proto_pid)
-    en_planets  = sum(1 for p in planets if p[1] == opp_pid)
+    my_ships   = sum(p[5] for p in planets if p[1] == proto_pid)
+    my_planets = sum(1   for p in planets if p[1] == proto_pid)
 
-    won = my_ships > en_ships or (my_ships == en_ships and my_planets >= en_planets)
+    if num_players == 4:
+        # Win = ranked 1st (most ships); or tied-first on ships by most planets
+        all_ships = {}
+        all_planets = {}
+        for p in planets:
+            pid = p[1]
+            if pid == -1:
+                continue
+            all_ships[pid]   = all_ships.get(pid, 0) + p[5]
+            all_planets[pid] = all_planets.get(pid, 0) + 1
+        rank1_ships = max(all_ships.values(), default=0)
+        won = (my_ships == rank1_ships and
+               my_planets >= max((all_planets.get(pid, 0) for pid, s in all_ships.items() if s == rank1_ships), default=0))
+    else:
+        opp_pid = 1 - proto_pid
+        en_ships   = sum(p[5] for p in planets if p[1] == opp_pid)
+        en_planets = sum(1   for p in planets if p[1] == opp_pid)
+        won = my_ships > en_ships or (my_ships == en_ships and my_planets >= en_planets)
+
     return won, snapshot
 
 
@@ -113,11 +141,18 @@ def main():
     parser.add_argument("--games",    type=int, default=40)
     parser.add_argument("--snap",     type=int, default=50,
                         help="Turn to capture mid-game snapshot (default 50)")
+    parser.add_argument("--players",   type=int, default=2, choices=[2, 4],
+                        help="Number of players: 2 (default) or 4 (FFA)")
+    parser.add_argument("--opponent2", default=None,
+                        help="Second opponent for 4P mix. "
+                             "4P layout (no --opponent3): proto + 2x opponent + 1x opponent2")
+    parser.add_argument("--opponent3", default=None,
+                        help="Third opponent for 4P mix. "
+                             "4P layout (with --opponent3): proto + 1x each of opponent/opponent2/opponent3")
     args = parser.parse_args()
 
     opp_path = OPPONENT_PATHS.get(args.opponent)
     if opp_path is None:
-        # Try as a direct path
         opp_path = Path(args.opponent)
     if not opp_path.exists():
         print(f"Opponent not found: {args.opponent}")
@@ -128,8 +163,35 @@ def main():
     opp_fn   = opp_mod.agent
     proto_fn = proto_agent.agent
 
+    opp_fn2 = None
+    if args.opponent2:
+        opp2_path = OPPONENT_PATHS.get(args.opponent2)
+        if opp2_path is None:
+            opp2_path = Path(args.opponent2)
+        if not opp2_path.exists():
+            print(f"Opponent2 not found: {args.opponent2}")
+            sys.exit(1)
+        opp2_mod = _load(str(opp2_path), args.opponent2 + "_2")
+        opp_fn2  = opp2_mod.agent
+
+    opp_fn3 = None
+    if args.opponent3:
+        opp3_path = OPPONENT_PATHS.get(args.opponent3)
+        if opp3_path is None:
+            opp3_path = Path(args.opponent3)
+        if not opp3_path.exists():
+            print(f"Opponent3 not found: {args.opponent3}")
+            sys.exit(1)
+        opp3_mod = _load(str(opp3_path), args.opponent3 + "_3")
+        opp_fn3  = opp3_mod.agent
+
+    mode = f"{args.players}P FFA" if args.players == 4 else "2P"
+    if args.players == 4 and opp_fn3:
+        mode = f"4P FFA (1x{args.opponent} + 1x{args.opponent2} + 1x{args.opponent3})"
+    elif args.players == 4 and opp_fn2:
+        mode = f"4P FFA (2x{args.opponent} + 1x{args.opponent2})"
     print(f"Benchmarking proto_agent vs {args.opponent}  "
-          f"({args.games} games, snapshot @ turn {args.snap})\n")
+          f"({args.games} games, {mode}, snapshot @ turn {args.snap})\n")
 
     proto_agent._logging_enabled = False
 
@@ -150,8 +212,9 @@ def main():
     print("-" * len(header))
 
     for i in range(args.games):
-        proto_first = (i % 2 == 0)
-        won, snap = run_game(proto_fn, opp_fn, proto_first, args.snap)
+        proto_first = i % (args.players if args.players == 4 else 2)
+        won, snap = run_game(proto_fn, opp_fn, proto_first, args.snap,
+                             num_players=args.players, opp_fn2=opp_fn2, opp_fn3=opp_fn3)
         if won is None:
             continue
 
