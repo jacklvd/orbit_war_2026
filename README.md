@@ -8,6 +8,8 @@ This repo holds the agent (`orbit_v2/`), the analysis tooling used to develop it
 and the design records for the experiments. The [game rules](#game-rules-reference)
 are documented at the bottom.
 
+https://www.kaggle.com/competitions/orbit-wars
+
 ---
 
 ## Result
